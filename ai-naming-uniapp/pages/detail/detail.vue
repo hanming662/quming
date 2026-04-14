@@ -62,7 +62,8 @@ export default {
       taskId: null,
       pollTimer: null,
       es: null,
-      requestTask: null
+      requestTask: null,
+      isAborting: false
     }
   },
   onLoad() {
@@ -73,6 +74,7 @@ export default {
   },
   methods: {
     clearConnection() {
+      this.isAborting = true
       if (this.pollTimer) {
         clearInterval(this.pollTimer)
         this.pollTimer = null
@@ -87,8 +89,10 @@ export default {
         } catch (e) {}
         this.requestTask = null
       }
+      this.isAborting = false
     },
     async startAnalyze() {
+      this.clearConnection()
       this.analyzing = true
       this.analysisContent = ''
       try {
@@ -151,6 +155,7 @@ export default {
           this.analyzing = false
         },
         fail: (err) => {
+          if (this.isAborting) return
           console.error('chunked request failed', err)
           this.analyzing = false
           // 降级轮询
@@ -172,6 +177,12 @@ export default {
           const data = line.substring(5).trim()
           if (data === '[DONE]') {
             this.analyzing = false
+            this.clearConnection()
+            return
+          }
+          if (data === '任务不存在或已过期' || data.includes('服务异常')) {
+            this.analyzing = false
+            this.analysisContent = data
             this.clearConnection()
             return
           }
