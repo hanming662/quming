@@ -12,6 +12,7 @@ import com.aining.vo.StreamTaskVO;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import javax.servlet.http.HttpServletRequest;
 import java.util.List;
@@ -42,9 +43,11 @@ public class NamingController {
         return Result.success(namingService.startDeepAnalyze(dto));
     }
 
-    @GetMapping("/stream/{taskId}")
-    public Result<String> stream(@PathVariable String taskId) {
-        return Result.success(namingService.pollStreamContent(taskId));
+    @GetMapping(value = "/stream/{taskId}", produces = "text/event-stream;charset=UTF-8")
+    public SseEmitter stream(@PathVariable String taskId) {
+        SseEmitter emitter = new SseEmitter(0L);
+        namingService.streamContent(taskId, emitter);
+        return emitter;
     }
 
     @GetMapping("/hot")
