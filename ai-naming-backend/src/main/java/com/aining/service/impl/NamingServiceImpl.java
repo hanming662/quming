@@ -130,27 +130,59 @@ public class NamingServiceImpl implements NamingService {
 
     @Override
     public String pollStreamContent(String taskId) {
-        Long len = redisTemplate.opsForList().size("stream:" + taskId);
-        if (len == null || len == 0) {
-            Boolean done = redisTemplate.hasKey("stream:done:" + taskId);
-            if (Boolean.TRUE.equals(done)) {
-                return "[DONE]";
-            }
-            return "";
+        StringBuilder sb = new StringBuilder();
+        Object chunk;
+        while ((chunk = redisTemplate.opsForList().leftPop("stream:" + taskId)) != null) {
+            sb.append(chunk.toString());
         }
-        List<Object> chunks = redisTemplate.opsForList().range("stream:" + taskId, 0, len - 1);
-        if (chunks == null) {
-            return "";
-        }
-        String content = chunks.stream()
-                .map(Object::toString)
-                .collect(Collectors.joining());
-
         Boolean done = redisTemplate.hasKey("stream:done:" + taskId);
         if (Boolean.TRUE.equals(done)) {
-            return content + "[DONE]";
+            sb.append("[DONE]");
         }
-        return content;
+        return sb.toString();
+    }
+
+    @Override
+    public void streamContent(String taskId, org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
+        new Thread(() -> {
+            int readIndex = 0;
+            int emptyLoops = 0;
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    Long len = redisTemplate.opsForList().size("stream:" + taskId);
+                    if (len != null && len > readIndex) {
+                        List<Object> chunks = redisTemplate.opsForList().range("stream:" + taskId, readIndex, len - 1);
+                        if (chunks != null && !chunks.isEmpty()) {
+                            for (Object chunk : chunks) {
+                                if (chunk != null) {
+                                    emitter.send(chunk.toString());
+                                }
+                            }
+                            readIndex += chunks.size();
+                        }
+                        emptyLoops = 0;
+                    } else {
+                        emptyLoops++;
+                        if (emptyLoops >= 100) {
+                            emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().comment("keepalive"));
+                            emptyLoops = 0;
+                        }
+                    }
+
+                    Boolean done = redisTemplate.hasKey("stream:done:" + taskId);
+                    if (Boolean.TRUE.equals(done)) {
+                        emitter.send("[DONE]");
+                        emitter.complete();
+                        return;
+                    }
+
+                    Thread.sleep(300);
+                }
+            } catch (Exception e) {
+                log.warn("SSE connection closed or error for taskId={}", taskId);
+                emitter.complete();
+            }
+        }).start();
     }
 
     @Override
