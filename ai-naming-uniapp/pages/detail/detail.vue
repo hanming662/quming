@@ -114,8 +114,11 @@ export default {
       // #ifdef H5
       this.connectStreamH5(taskId)
       // #endif
-      // #ifndef H5
+      // #ifdef APP-PLUS
       this.connectStreamUni(taskId)
+      // #endif
+      // #ifdef MP-WEIXIN
+      this.pollTimer = setInterval(() => this.pollAnalysis(), 800)
       // #endif
     },
     connectStreamH5(taskId) {
@@ -159,7 +162,7 @@ export default {
           console.error('chunked request failed', err)
           this.analyzing = false
           // 降级轮询
-          this.pollTimer = setInterval(() => this.pollAnalysis(), 500)
+          this.pollTimer = setInterval(() => this.pollAnalysis(), 800)
         }
       })
       this.requestTask = requestTask
