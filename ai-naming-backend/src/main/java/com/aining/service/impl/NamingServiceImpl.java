@@ -179,6 +179,11 @@ public class NamingServiceImpl implements NamingService {
     }
 
     private void finishTask(String taskId) {
+        StringBuilder sb = taskBuffers.get(taskId);
+        if (sb == null || sb.length() == 0) {
+            taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
+                    .append("分析结果为空，请检查 AI 配置或稍后重试。");
+        }
         taskDone.put(taskId, true);
         CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.remove(taskId);
         if (emitters != null) {
@@ -246,7 +251,7 @@ public class NamingServiceImpl implements NamingService {
             CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.computeIfAbsent(taskId, k -> new CopyOnWriteArrayList<>());
             emitters.add(emitter);
 
-            // 再次检查，防止在 add 前一刻任务刚好完成
+            // 再次检查，防止在 add 前一任任务刚好完成
             if (Boolean.TRUE.equals(taskDone.get(taskId))) {
                 completeEmitterWithDone(emitter, sb.toString());
                 emitters.remove(emitter);
