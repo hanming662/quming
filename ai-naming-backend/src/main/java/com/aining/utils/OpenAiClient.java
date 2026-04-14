@@ -8,10 +8,17 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
-import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
-import javax.annotation.PostConstruct;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -28,52 +35,112 @@ public class OpenAiClient {
     @Value("${ai.model}")
     private String model;
 
-    private WebClient webClient;
-
-    @PostConstruct
-    public void init() {
-        this.webClient = WebClient.builder()
-                .baseUrl(baseUrl)
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
-                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-                .build();
-    }
-
     public String chatCompletion(String systemPrompt, String userPrompt) {
         Map<String, Object> body = buildRequestBody(systemPrompt, userPrompt, false);
+        HttpURLConnection conn = null;
         try {
-            String response = webClient.post()
-                    .uri("/chat/completions")
-                    .bodyValue(body)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
+            conn = createConnection("/chat/completions");
+            String jsonBody = JSON.toJSONString(body);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+            }
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String response = readAll(is);
+            if (code < 200 || code >= 300) {
+                log.error("AI API error, code={}, response={}", code, response);
+                throw new RuntimeException("AI服务调用失败: " + response);
+            }
             return extractContent(response);
-        } catch (Exception e) {
+        } catch (IOException e) {
             log.error("AI chat completion error", e);
             throw new RuntimeException("AI服务调用失败：" + e.getMessage());
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
     }
 
     public Flux<String> chatCompletionStream(String systemPrompt, String userPrompt) {
         Map<String, Object> body = buildRequestBody(systemPrompt, userPrompt, true);
-        return webClient.post()
-                .uri("/chat/completions")
-                .bodyValue(body)
-                .header(HttpHeaders.ACCEPT, MediaType.TEXT_EVENT_STREAM_VALUE)
-                .retrieve()
-                .onStatus(status -> status.isError(), clientResponse ->
-                        clientResponse.bodyToMono(String.class)
-                                .doOnNext(errorBody -> log.error("AI stream API error: {}", errorBody))
-                                .map(errorBody -> new RuntimeException("AI服务调用失败: " + errorBody))
-                )
-                .bodyToFlux(String.class)
-                .filter(line -> line.startsWith("data:"))
-                .map(line -> line.substring(5).trim())
-                .filter(line -> !"[DONE]".equals(line))
-                .map(this::extractStreamContent)
-                .filter(s -> s != null && !s.isEmpty())
-                .doOnNext(chunk -> log.debug("AI stream chunk: {}", chunk));
+        String jsonBody = JSON.toJSONString(body);
+        return Flux.<String>create(sink -> {
+            HttpURLConnection conn = null;
+            try {
+                log.info("AI stream request start, model={}", model);
+                conn = createConnection("/chat/completions");
+                try (OutputStream os = conn.getOutputStream()) {
+                    os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+                }
+
+                int code = conn.getResponseCode();
+                InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+                if (code < 200 || code >= 300) {
+                    String errorBody = readAll(is);
+                    log.error("AI stream API error, code={}, response={}", code, errorBody);
+                    sink.error(new RuntimeException("AI服务调用失败: " + errorBody));
+                    return;
+                }
+
+                log.info("AI stream connection established, reading chunks...");
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null && !sink.isCancelled()) {
+                        log.debug("AI raw line: {}", line);
+                        if (line.startsWith("data:")) {
+                            String data = line.substring(5).trim();
+                            if ("[DONE]".equals(data)) {
+                                log.info("AI stream [DONE] received");
+                                sink.complete();
+                                return;
+                            }
+                            String chunk = extractStreamContent(data);
+                            if (chunk != null && !chunk.isEmpty()) {
+                                log.debug("AI parsed chunk: {}", chunk);
+                                sink.next(chunk);
+                            }
+                        }
+                    }
+                    log.info("AI stream read finished");
+                    sink.complete();
+                }
+            } catch (Exception e) {
+                log.error("AI stream connection error", e);
+                sink.error(e);
+            } finally {
+                if (conn != null) {
+                    conn.disconnect();
+                }
+            }
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private HttpURLConnection createConnection(String path) throws IOException {
+        URL url = new URL(baseUrl + path);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE);
+        conn.setRequestProperty(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey);
+        conn.setRequestProperty(HttpHeaders.ACCEPT, MediaType.TEXT_EVENT_STREAM_VALUE);
+        conn.setDoOutput(true);
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(120000);
+        return conn;
+    }
+
+    private String readAll(InputStream is) throws IOException {
+        if (is == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append("\n");
+            }
+        }
+        return sb.toString();
     }
 
     private Map<String, Object> buildRequestBody(String systemPrompt, String userPrompt, boolean stream) {
