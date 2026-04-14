@@ -1,4 +1,4 @@
-const BASE_URL = 'http://localhost:8080'
+export const BASE_URL = 'http://localhost:8080'
 
 function request(options) {
   return new Promise((resolve, reject) => {
