@@ -174,7 +174,7 @@ export default {
     },
     async pollAnalysis() {
       try {
-        const text = await request.get('/api/naming/stream/' + this.taskId)
+        const text = await request.get('/api/naming/poll/' + this.taskId)
         if (text.includes('[DONE]')) {
           this.analysisContent = text.replace('[DONE]', '')
           this.analyzing = false
@@ -185,6 +185,9 @@ export default {
         }
       } catch (e) {
         console.error(e)
+        this.analyzing = false
+        clearInterval(this.pollTimer)
+        this.pollTimer = null
       }
     }
   }
