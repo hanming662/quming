@@ -49,8 +49,12 @@ public class NamingServiceImpl implements NamingService {
     @Autowired
     private OpenAiClient openAiClient;
 
-    @Autowired
-    private Executor executor;
+    // 自己维护线程池，避免依赖外部 Executor bean 配置
+    private final ExecutorService analyzeExecutor = Executors.newFixedThreadPool(4, r -> {
+        Thread t = new Thread(r, "deep-analyze-" + System.currentTimeMillis());
+        t.setDaemon(true);
+        return t;
+    });
 
     // 内存级流式任务缓存
     private final ConcurrentHashMap<String, StringBuilder> taskBuffers = new ConcurrentHashMap<>();
@@ -65,6 +69,7 @@ public class NamingServiceImpl implements NamingService {
 
     @PreDestroy
     public void destroy() {
+        analyzeExecutor.shutdownNow();
         cleanupExecutor.shutdownNow();
     }
 
@@ -113,13 +118,15 @@ public class NamingServiceImpl implements NamingService {
             taskDone.put(taskId, false);
             taskEmitters.put(taskId, new CopyOnWriteArrayList<>());
         }
-        executor.execute(() -> runDeepAnalyzeAsync(taskId, dto));
+        log.info("Start deep analyze, taskId={}", taskId);
+        analyzeExecutor.execute(() -> runDeepAnalyzeAsync(taskId, dto));
         StreamTaskVO vo = new StreamTaskVO();
         vo.setTaskId(taskId);
         return vo;
     }
 
     private void runDeepAnalyzeAsync(String taskId, AnalyzeRequestDTO dto) {
+        log.info("Run deep analyze async, taskId={}", taskId);
         try {
             String systemPrompt = "你是一位精通易经、五行、音韵学和现代心理学的取名分析大师。请对以下名字进行深度分析，从易经八卦、五行八字、字形美学、音韵节奏、心理暗示等角度进行解读。";
             String userPrompt = String.format(
@@ -161,6 +168,7 @@ public class NamingServiceImpl implements NamingService {
                         }
                     },
                     () -> {
+                        log.info("深度分析流式调用完成, taskId={}", taskId);
                         Object lock = taskLocks.get(taskId);
                         synchronized (lock != null ? lock : new Object()) {
                             finishTask(taskId);
@@ -179,6 +187,7 @@ public class NamingServiceImpl implements NamingService {
     }
 
     private void finishTask(String taskId) {
+        log.info("Finish deep analyze task, taskId={}", taskId);
         StringBuilder sb = taskBuffers.get(taskId);
         if (sb == null || sb.length() == 0) {
             taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
