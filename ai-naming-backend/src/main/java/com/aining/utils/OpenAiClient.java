@@ -71,7 +71,9 @@ public class OpenAiClient {
                 .filter(line -> line.startsWith("data:"))
                 .map(line -> line.substring(5).trim())
                 .filter(line -> !"[DONE]".equals(line))
-                .map(this::extractStreamContent);
+                .map(this::extractStreamContent)
+                .filter(s -> s != null && !s.isEmpty())
+                .doOnNext(chunk -> log.debug("AI stream chunk: {}", chunk));
     }
 
     private Map<String, Object> buildRequestBody(String systemPrompt, String userPrompt, boolean stream) {
@@ -112,7 +114,8 @@ public class OpenAiClient {
             if (choices != null && !choices.isEmpty()) {
                 JSONObject delta = choices.getJSONObject(0).getJSONObject("delta");
                 if (delta != null) {
-                    return delta.getString("content");
+                    String content = delta.getString("content");
+                    return content != null ? content : "";
                 }
             }
         } catch (Exception e) {
