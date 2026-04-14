@@ -7,14 +7,14 @@ spring:
   
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://localhost:3306/ai_naming?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false
+    url: jdbc:mysql://116.204.135.42:3306/ai_quming?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false
     username: root
-    password: 123456
+    password: root123321
   
   redis:
-    host: localhost
+    host: 116.204.135.42
     port: 6379
-    password: 
+    password: root123321
     database: 0
     timeout: 5000ms
     lettuce:
@@ -39,7 +39,7 @@ mybatis-plus:
 # AI Configuration
 ai:
   # 支持 OpenAI 兼容格式的API：DeepSeek、硅基流动、阿里云百炼等
-  api-key: ${AI_API_KEY:your-api-key-here}
+  api-key: ${AI_API_KEY:sk-ce2465a5eb6b4bf3b88fb246f4dfb9b3}
   base-url: ${AI_BASE_URL:https://api.deepseek.com}
   model: ${AI_MODEL:deepseek-chat}
   # 流式分片大小（字符数）
@@ -48,8 +48,8 @@ ai:
 # 小程序配置
 wx:
   miniapp:
-    appid: ${WX_APPID:your-appid}
-    secret: ${WX_SECRET:your-secret}
+    appid: ${WX_APPID:wxd2b015771eedba15}
+    secret: ${WX_SECRET:54483368b9e997331b4a8e5d62d34a35}
 
 logging:
   level:
