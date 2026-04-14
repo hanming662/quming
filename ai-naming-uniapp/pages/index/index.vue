@@ -12,7 +12,7 @@
           class="input"
           v-model="form.fatherSurname"
           placeholder="请输入父姓"
-          maxlength="2"
+          maxlength="5"
         />
       </view>
 
@@ -22,7 +22,7 @@
           class="input"
           v-model="form.motherSurname"
           placeholder="可融入名字构思"
-          maxlength="2"
+          maxlength="5"
         />
       </view>
 
