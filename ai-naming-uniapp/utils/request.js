@@ -1,4 +1,11 @@
+// 请根据实际部署环境修改 BASE_URL
+// #ifdef H5
 export const BASE_URL = 'http://localhost:8080'
+// #endif
+// #ifndef H5
+// 微信小程序 / App 请使用真实后端域名（必须 HTTPS 且备案）
+export const BASE_URL = 'https://your-production-domain.com'
+// #endif
 
 function request(options) {
   return new Promise((resolve, reject) => {
