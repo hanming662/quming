@@ -102,6 +102,7 @@ export default {
         this.connectStream(vo.taskId)
       } catch (e) {
         this.analyzing = false
+        uni.showToast({ title: '请求失败，请重试', icon: 'none' })
         console.error(e)
       }
     },
@@ -109,13 +110,8 @@ export default {
       // #ifdef H5
       this.connectStreamH5(taskId)
       // #endif
-      // #ifdef MP-WEIXIN
-      this.connectStreamWx(taskId)
-      // #endif
-      // #ifndef H5 || MP-WEIXIN
-      this.pollTimer = setInterval(() => {
-        this.pollAnalysis()
-      }, 800)
+      // #ifndef H5
+      this.connectStreamUni(taskId)
       // #endif
     },
     connectStreamH5(taskId) {
@@ -134,9 +130,9 @@ export default {
         es.close()
       }
     },
-    connectStreamWx(taskId) {
+    connectStreamUni(taskId) {
       const openid = uni.getStorageSync('openid') || ''
-      const requestTask = wx.request({
+      const requestTask = uni.request({
         url: BASE_URL + '/api/naming/stream/' + taskId,
         method: 'GET',
         header: { 'X-Openid': openid },
@@ -144,8 +140,11 @@ export default {
         success: () => {
           this.analyzing = false
         },
-        fail: () => {
+        fail: (err) => {
+          console.error('chunked request failed', err)
           this.analyzing = false
+          // 降级轮询
+          this.pollTimer = setInterval(() => this.pollAnalysis(), 500)
         }
       })
       this.requestTask = requestTask
@@ -175,13 +174,16 @@ export default {
     async pollAnalysis() {
       try {
         const text = await request.get('/api/naming/poll/' + this.taskId)
-        if (text.includes('[DONE]')) {
-          this.analysisContent = text.replace('[DONE]', '')
+        const done = text.includes('[DONE]')
+        const content = done ? text.replace('[DONE]', '') : text
+        // 只追加新增部分，避免整段闪烁
+        if (content.length > this.analysisContent.length) {
+          this.analysisContent = content
+        }
+        if (done) {
           this.analyzing = false
           clearInterval(this.pollTimer)
           this.pollTimer = null
-        } else {
-          this.analysisContent = text
         }
       } catch (e) {
         console.error(e)
