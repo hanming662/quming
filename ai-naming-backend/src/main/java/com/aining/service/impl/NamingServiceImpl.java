@@ -19,15 +19,16 @@ import com.alibaba.fastjson2.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.publisher.Flux;
 
+import javax.annotation.PreDestroy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -49,11 +50,20 @@ public class NamingServiceImpl implements NamingService {
     @Autowired
     private OpenAiClient openAiClient;
 
-    @Autowired
-    private RedisTemplate<String, Object> redisTemplate;
+    // 内存级流式任务缓存
+    private final ConcurrentHashMap<String, StringBuilder> taskBuffers = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Boolean> taskDone = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CopyOnWriteArrayList<SseEmitter>> taskEmitters = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "analyze-cleanup");
+        t.setDaemon(true);
+        return t;
+    });
 
-    @Value("${ai.stream-chunk-size:20}")
-    private Integer streamChunkSize;
+    @PreDestroy
+    public void destroy() {
+        cleanupExecutor.shutdownNow();
+    }
 
     @Override
     public List<NameResultVO> generateNames(Long userId, NamingRequestDTO dto) {
@@ -94,6 +104,9 @@ public class NamingServiceImpl implements NamingService {
     @Override
     public StreamTaskVO startDeepAnalyze(AnalyzeRequestDTO dto) {
         String taskId = UUID.randomUUID().toString();
+        taskBuffers.put(taskId, new StringBuilder());
+        taskDone.put(taskId, false);
+        taskEmitters.put(taskId, new CopyOnWriteArrayList<>());
         runDeepAnalyzeAsync(taskId, dto);
         StreamTaskVO vo = new StreamTaskVO();
         vo.setTaskId(taskId);
@@ -112,77 +125,121 @@ public class NamingServiceImpl implements NamingService {
                     dto.getMotherSurname() != null ? dto.getMotherSurname() : "无"
             );
 
-            openAiClient.chatCompletionStream(systemPrompt, userPrompt)
-                    .toStream()
-                    .forEach(chunk -> {
-                        if (chunk != null) {
-                            redisTemplate.opsForList().rightPush("stream:" + taskId, chunk);
-                        }
-                    });
+            Flux<String> flux = openAiClient.chatCompletionStream(systemPrompt, userPrompt);
 
-            redisTemplate.opsForValue().set("stream:done:" + taskId, "true", 10, TimeUnit.MINUTES);
+            flux.subscribe(
+                    chunk -> {
+                        if (chunk != null && !chunk.isEmpty()) {
+                            taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder()).append(chunk);
+                            CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.get(taskId);
+                            if (emitters != null) {
+                                for (SseEmitter emitter : emitters) {
+                                    try {
+                                        emitter.send(chunk);
+                                    } catch (Exception e) {
+                                        emitters.remove(emitter);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    error -> {
+                        log.error("深度分析流式调用失败, taskId={}", taskId, error);
+                        taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
+                                .append("\n\n分析服务异常，请稍后重试。");
+                        finishTask(taskId);
+                    },
+                    () -> finishTask(taskId)
+            );
         } catch (Exception e) {
-            log.error("深度分析失败", e);
-            redisTemplate.opsForList().rightPush("stream:" + taskId, "\n\n分析服务异常，请稍后重试。");
-            redisTemplate.opsForValue().set("stream:done:" + taskId, "true", 10, TimeUnit.MINUTES);
+            log.error("深度分析失败, taskId={}", taskId, e);
+            taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
+                    .append("\n\n分析服务异常，请稍后重试。");
+            finishTask(taskId);
         }
+    }
+
+    private void finishTask(String taskId) {
+        taskDone.put(taskId, true);
+        CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.remove(taskId);
+        if (emitters != null) {
+            for (SseEmitter emitter : emitters) {
+                try {
+                    emitter.send("[DONE]");
+                    emitter.complete();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        // 10 分钟后清理内存
+        cleanupExecutor.schedule(() -> {
+            taskBuffers.remove(taskId);
+            taskDone.remove(taskId);
+            taskEmitters.remove(taskId);
+            log.info("清理深度分析任务缓存, taskId={}", taskId);
+        }, 10, TimeUnit.MINUTES);
     }
 
     @Override
     public String pollStreamContent(String taskId) {
-        StringBuilder sb = new StringBuilder();
-        Object chunk;
-        while ((chunk = redisTemplate.opsForList().leftPop("stream:" + taskId)) != null) {
-            sb.append(chunk.toString());
+        StringBuilder sb = taskBuffers.get(taskId);
+        if (sb == null) {
+            return Boolean.TRUE.equals(taskDone.get(taskId)) ? "[DONE]" : "";
         }
-        Boolean done = redisTemplate.hasKey("stream:done:" + taskId);
-        if (Boolean.TRUE.equals(done)) {
-            sb.append("[DONE]");
+        String content = sb.toString();
+        if (Boolean.TRUE.equals(taskDone.get(taskId))) {
+            content += "[DONE]";
+            cleanupExecutor.schedule(() -> {
+                taskBuffers.remove(taskId);
+                taskDone.remove(taskId);
+                taskEmitters.remove(taskId);
+            }, 30, TimeUnit.SECONDS);
         }
-        return sb.toString();
+        return content;
     }
 
     @Override
-    public void streamContent(String taskId, org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
-        new Thread(() -> {
-            int readIndex = 0;
-            int emptyLoops = 0;
+    public void streamContent(String taskId, SseEmitter emitter) {
+        Boolean done = taskDone.get(taskId);
+        StringBuilder sb = taskBuffers.get(taskId);
+
+        if (done == null || sb == null) {
             try {
-                while (!Thread.currentThread().isInterrupted()) {
-                    Long len = redisTemplate.opsForList().size("stream:" + taskId);
-                    if (len != null && len > readIndex) {
-                        List<Object> chunks = redisTemplate.opsForList().range("stream:" + taskId, readIndex, len - 1);
-                        if (chunks != null && !chunks.isEmpty()) {
-                            for (Object chunk : chunks) {
-                                if (chunk != null) {
-                                    emitter.send(chunk.toString());
-                                }
-                            }
-                            readIndex += chunks.size();
-                        }
-                        emptyLoops = 0;
-                    } else {
-                        emptyLoops++;
-                        if (emptyLoops >= 100) {
-                            emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().comment("keepalive"));
-                            emptyLoops = 0;
-                        }
-                    }
-
-                    Boolean done = redisTemplate.hasKey("stream:done:" + taskId);
-                    if (Boolean.TRUE.equals(done)) {
-                        emitter.send("[DONE]");
-                        emitter.complete();
-                        return;
-                    }
-
-                    Thread.sleep(300);
-                }
-            } catch (Exception e) {
-                log.warn("SSE connection closed or error for taskId={}", taskId);
+                emitter.send("任务不存在或已过期");
                 emitter.complete();
+            } catch (Exception ignored) {
             }
-        }).start();
+            return;
+        }
+
+        if (done) {
+            try {
+                emitter.send(sb.toString());
+                emitter.send("[DONE]");
+                emitter.complete();
+            } catch (Exception ignored) {
+            }
+            return;
+        }
+
+        CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.computeIfAbsent(taskId, k -> new CopyOnWriteArrayList<>());
+        emitters.add(emitter);
+
+        emitter.onCompletion(() -> emitters.remove(emitter));
+        emitter.onTimeout(() -> {
+            emitters.remove(emitter);
+            try {
+                emitter.complete();
+            } catch (Exception ignored) {
+            }
+        });
+        emitter.onError((e) -> {
+            emitters.remove(emitter);
+            try {
+                emitter.completeWithError(e);
+            } catch (Exception ignored) {
+            }
+        });
     }
 
     @Override
@@ -224,7 +281,7 @@ public class NamingServiceImpl implements NamingService {
                         "[{\"name\":\"名字\",\"pinyin\":\"拼音\",\"meaning\":\"寓意\",\"wuxing\":\"五行分析\",\"yinyunScore\":8,\"timesScore\":8,\"totalScore\":85,\"reason\":\"推荐理由\"}]",
                 "boy".equals(dto.getGender()) ? "男" : "女",
                 dto.getFatherSurname(),
-                               dto.getMotherSurname() != null && !dto.getMotherSurname().isEmpty() ? dto.getMotherSurname() : "无",
+                dto.getMotherSurname() != null && !dto.getMotherSurname().isEmpty() ? dto.getMotherSurname() : "无",
                 dto.getPrompt() != null && !dto.getPrompt().isEmpty() ? "家长期望：" + dto.getPrompt() : "",
                 dto.getStyle(),
                 dto.getCount()
