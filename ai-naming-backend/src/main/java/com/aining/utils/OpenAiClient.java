@@ -69,16 +69,21 @@ public class OpenAiClient {
     }
 
     private Map<String, Object> buildRequestBody(String systemPrompt, String userPrompt, boolean stream) {
-        List<Map<String, String>> messages = java.util.Arrays.asList(
-                Map.of("role", "system", "content", systemPrompt),
-                Map.of("role", "user", "content", userPrompt)
-        );
-        return Map.of(
-                "model", model,
-                "messages", messages,
-                "stream", stream,
-                "temperature", 0.8
-        );
+        List<Map<String, String>> messages = new java.util.ArrayList<>();
+        Map<String, String> systemMsg = new java.util.HashMap<>();
+        systemMsg.put("role", "system");
+        systemMsg.put("content", systemPrompt);
+        messages.add(systemMsg);
+        Map<String, String> userMsg = new java.util.HashMap<>();
+        userMsg.put("role", "user");
+        userMsg.put("content", userPrompt);
+        messages.add(userMsg);
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("model", model);
+        body.put("messages", messages);
+        body.put("stream", stream);
+        body.put("temperature", 0.8);
+        return body;
     }
 
     private String extractContent(String responseJson) {
