@@ -43,7 +43,7 @@
         <text>点击获取深度分析</text>
       </view>
       <view v-else class="analysis-content">
-        <text class="paragraph typing">{{ analysisContent }}</text>
+        <text class="paragraph typing">{{ analysisContent || ' ' }}</text>
         <view v-if="analyzing" class="typing-cursor"></view>
       </view>
     </view>
@@ -52,6 +52,9 @@
 
 <script>
 import request, { BASE_URL } from '@/utils/request.js'
+
+const POLL_INTERVAL = 300 // 轮询间隔 300ms
+const MAX_ANALYZE_TIME = 90000 // 最大分析时长 90s
 
 export default {
   data() {
@@ -63,7 +66,9 @@ export default {
       pollTimer: null,
       es: null,
       requestTask: null,
-      isAborting: false
+      isAborting: false,
+      analyzeStartTime: 0,
+      timeoutTimer: null
     }
   },
   onLoad() {
@@ -78,6 +83,10 @@ export default {
       if (this.pollTimer) {
         clearInterval(this.pollTimer)
         this.pollTimer = null
+      }
+      if (this.timeoutTimer) {
+        clearTimeout(this.timeoutTimer)
+        this.timeoutTimer = null
       }
       if (this.es) {
         this.es.close()
@@ -95,6 +104,17 @@ export default {
       this.clearConnection()
       this.analyzing = true
       this.analysisContent = ''
+      this.analyzeStartTime = Date.now()
+      // 全局超时保护
+      this.timeoutTimer = setTimeout(() => {
+        if (this.analyzing) {
+          this.analyzing = false
+          if (!this.analysisContent || this.analysisContent.trim() === '') {
+            this.analysisContent = '分析超时，请检查网络或稍后重试。'
+          }
+          this.clearConnection()
+        }
+      }, MAX_ANALYZE_TIME)
       try {
         const vo = await request.post('/api/naming/deepAnalyze', {
           name: this.nameData.name,
@@ -103,11 +123,13 @@ export default {
           motherSurname: this.nameData.motherSurname || ''
         })
         this.taskId = vo.taskId
+        console.log('deepAnalyze taskId:', vo.taskId)
         this.connectStream(vo.taskId)
       } catch (e) {
         this.analyzing = false
+        this.clearConnection()
         uni.showToast({ title: '请求失败，请重试', icon: 'none' })
-        console.error(e)
+        console.error('deepAnalyze error', e)
       }
     },
     connectStream(taskId) {
@@ -118,7 +140,7 @@ export default {
       this.connectStreamUni(taskId)
       // #endif
       // #ifdef MP-WEIXIN
-      this.pollTimer = setInterval(() => this.pollAnalysis(), 800)
+      this.pollTimer = setInterval(() => this.pollAnalysis(), POLL_INTERVAL)
       // #endif
     },
     connectStreamH5(taskId) {
@@ -127,23 +149,20 @@ export default {
       es.onmessage = (event) => {
         if (event.data === '[DONE]') {
           this.analyzing = false
-          es.close()
-          this.es = null
+          this.clearConnection()
           return
         }
         if (event.data === '任务不存在或已过期' || event.data.includes('服务异常') || event.data.includes('分析结果为空')) {
           this.analyzing = false
           this.analysisContent = event.data
-          es.close()
-          this.es = null
+          this.clearConnection()
           return
         }
         this.analysisContent += event.data
       }
       es.onerror = (err) => {
         this.analyzing = false
-        es.close()
-        this.es = null
+        this.clearConnection()
         console.error('EventSource error', err)
       }
     },
@@ -156,13 +175,15 @@ export default {
         enableChunked: true,
         success: () => {
           this.analyzing = false
+          this.clearConnection()
         },
         fail: (err) => {
           if (this.isAborting) return
           console.error('chunked request failed', err)
           this.analyzing = false
+          this.clearConnection()
           // 降级轮询
-          this.pollTimer = setInterval(() => this.pollAnalysis(), 800)
+          this.pollTimer = setInterval(() => this.pollAnalysis(), POLL_INTERVAL)
         }
       })
       this.requestTask = requestTask
@@ -198,10 +219,9 @@ export default {
     async pollAnalysis() {
       try {
         const text = await request.get('/api/naming/poll/' + this.taskId)
-        console.log('poll result:', text)
+        console.log('poll result taskId=', this.taskId, 'text=', JSON.stringify(text), 'elapsed=', Date.now() - this.analyzeStartTime)
         const done = text.includes('[DONE]')
         const content = done ? text.replace('[DONE]', '') : text
-        // 只追加新增部分，避免整段闪烁
         if (content.length > this.analysisContent.length) {
           this.analysisContent = content
         }
@@ -210,14 +230,12 @@ export default {
             this.analysisContent = '分析结果为空，请检查网络或稍后重试。'
           }
           this.analyzing = false
-          clearInterval(this.pollTimer)
-          this.pollTimer = null
+          this.clearConnection()
         }
       } catch (e) {
         console.error('poll error', e)
         this.analyzing = false
-        clearInterval(this.pollTimer)
-        this.pollTimer = null
+        this.clearConnection()
       }
     }
   }
