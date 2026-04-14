@@ -131,7 +131,7 @@ export default {
           this.es = null
           return
         }
-        if (event.data === '任务不存在或已过期' || event.data.includes('服务异常')) {
+        if (event.data === '任务不存在或已过期' || event.data.includes('服务异常') || event.data.includes('分析结果为空')) {
           this.analyzing = false
           this.analysisContent = event.data
           es.close()
@@ -183,7 +183,7 @@ export default {
             this.clearConnection()
             return
           }
-          if (data === '任务不存在或已过期' || data.includes('服务异常')) {
+          if (data === '任务不存在或已过期' || data.includes('服务异常') || data.includes('分析结果为空')) {
             this.analyzing = false
             this.analysisContent = data
             this.clearConnection()
@@ -198,6 +198,7 @@ export default {
     async pollAnalysis() {
       try {
         const text = await request.get('/api/naming/poll/' + this.taskId)
+        console.log('poll result:', text)
         const done = text.includes('[DONE]')
         const content = done ? text.replace('[DONE]', '') : text
         // 只追加新增部分，避免整段闪烁
@@ -205,12 +206,15 @@ export default {
           this.analysisContent = content
         }
         if (done) {
+          if (!this.analysisContent || this.analysisContent.trim() === '') {
+            this.analysisContent = '分析结果为空，请检查网络或稍后重试。'
+          }
           this.analyzing = false
           clearInterval(this.pollTimer)
           this.pollTimer = null
         }
       } catch (e) {
-        console.error(e)
+        console.error('poll error', e)
         this.analyzing = false
         clearInterval(this.pollTimer)
         this.pollTimer = null
