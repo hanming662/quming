@@ -50,6 +50,11 @@ public class NamingController {
         return emitter;
     }
 
+    @GetMapping("/poll/{taskId}")
+    public Result<String> poll(@PathVariable String taskId) {
+        return Result.success(namingService.pollStreamContent(taskId));
+    }
+
     @GetMapping("/hot")
     public Result<List<NameResultVO>> hot(@RequestParam(required = false) String gender,
                                           @RequestParam(defaultValue = "20") Integer limit) {

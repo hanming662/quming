@@ -51,7 +51,7 @@
 </template>
 
 <script>
-import request from '@/utils/request.js'
+import request, { BASE_URL } from '@/utils/request.js'
 
 export default {
   data() {
@@ -60,20 +60,37 @@ export default {
       analyzing: false,
       analysisContent: '',
       taskId: null,
-      pollTimer: null
+      pollTimer: null,
+      es: null,
+      requestTask: null
     }
   },
   onLoad() {
     this.nameData = uni.getStorageSync('current_name') || {}
   },
   onUnload() {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer)
-    }
+    this.clearConnection()
   },
   methods: {
+    clearConnection() {
+      if (this.pollTimer) {
+        clearInterval(this.pollTimer)
+        this.pollTimer = null
+      }
+      if (this.es) {
+        this.es.close()
+        this.es = null
+      }
+      if (this.requestTask) {
+        try {
+          this.requestTask.abort()
+        } catch (e) {}
+        this.requestTask = null
+      }
+    },
     async startAnalyze() {
       this.analyzing = true
+      this.analysisContent = ''
       try {
         const vo = await request.post('/api/naming/deepAnalyze', {
           name: this.nameData.name,
@@ -82,26 +99,97 @@ export default {
           motherSurname: this.nameData.motherSurname || ''
         })
         this.taskId = vo.taskId
-        this.pollTimer = setInterval(() => {
-          this.pollAnalysis()
-        }, 500)
+        this.connectStream(vo.taskId)
       } catch (e) {
         this.analyzing = false
+        uni.showToast({ title: '请求失败，请重试', icon: 'none' })
         console.error(e)
+      }
+    },
+    connectStream(taskId) {
+      // #ifdef H5
+      this.connectStreamH5(taskId)
+      // #endif
+      // #ifndef H5
+      this.connectStreamUni(taskId)
+      // #endif
+    },
+    connectStreamH5(taskId) {
+      const es = new EventSource(BASE_URL + '/api/naming/stream/' + taskId)
+      this.es = es
+      es.onmessage = (event) => {
+        if (event.data === '[DONE]') {
+          this.analyzing = false
+          es.close()
+          return
+        }
+        this.analysisContent += event.data
+      }
+      es.onerror = () => {
+        this.analyzing = false
+        es.close()
+      }
+    },
+    connectStreamUni(taskId) {
+      const openid = uni.getStorageSync('openid') || ''
+      const requestTask = uni.request({
+        url: BASE_URL + '/api/naming/stream/' + taskId,
+        method: 'GET',
+        header: { 'X-Openid': openid },
+        enableChunked: true,
+        success: () => {
+          this.analyzing = false
+        },
+        fail: (err) => {
+          console.error('chunked request failed', err)
+          this.analyzing = false
+          // 降级轮询
+          this.pollTimer = setInterval(() => this.pollAnalysis(), 500)
+        }
+      })
+      this.requestTask = requestTask
+      requestTask.onChunkReceived((res) => {
+        const buffer = new Uint8Array(res.data)
+        const text = new TextDecoder('utf-8').decode(buffer)
+        this.parseSseChunks(text)
+      })
+    },
+    parseSseChunks(text) {
+      const lines = text.split('\n')
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim()
+        if (line.startsWith('data:')) {
+          const data = line.substring(5).trim()
+          if (data === '[DONE]') {
+            this.analyzing = false
+            this.clearConnection()
+            return
+          }
+          if (data) {
+            this.analysisContent += data
+          }
+        }
       }
     },
     async pollAnalysis() {
       try {
-        const text = await request.get('/api/naming/stream/' + this.taskId)
-        if (text.includes('[DONE]')) {
-          this.analysisContent = text.replace('[DONE]', '')
+        const text = await request.get('/api/naming/poll/' + this.taskId)
+        const done = text.includes('[DONE]')
+        const content = done ? text.replace('[DONE]', '') : text
+        // 只追加新增部分，避免整段闪烁
+        if (content.length > this.analysisContent.length) {
+          this.analysisContent = content
+        }
+        if (done) {
           this.analyzing = false
           clearInterval(this.pollTimer)
-        } else {
-          this.analysisContent = text
+          this.pollTimer = null
         }
       } catch (e) {
         console.error(e)
+        this.analyzing = false
+        clearInterval(this.pollTimer)
+        this.pollTimer = null
       }
     }
   }
