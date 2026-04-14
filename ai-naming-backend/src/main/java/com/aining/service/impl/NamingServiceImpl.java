@@ -19,7 +19,6 @@ import com.alibaba.fastjson2.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.publisher.Flux;
@@ -50,10 +49,14 @@ public class NamingServiceImpl implements NamingService {
     @Autowired
     private OpenAiClient openAiClient;
 
+    @Autowired
+    private Executor executor;
+
     // 内存级流式任务缓存
     private final ConcurrentHashMap<String, StringBuilder> taskBuffers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> taskDone = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CopyOnWriteArrayList<SseEmitter>> taskEmitters = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Object> taskLocks = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "analyze-cleanup");
         t.setDaemon(true);
@@ -104,17 +107,19 @@ public class NamingServiceImpl implements NamingService {
     @Override
     public StreamTaskVO startDeepAnalyze(AnalyzeRequestDTO dto) {
         String taskId = UUID.randomUUID().toString();
-        taskBuffers.put(taskId, new StringBuilder());
-        taskDone.put(taskId, false);
-        taskEmitters.put(taskId, new CopyOnWriteArrayList<>());
-        runDeepAnalyzeAsync(taskId, dto);
+        Object lock = taskLocks.computeIfAbsent(taskId, k -> new Object());
+        synchronized (lock) {
+            taskBuffers.put(taskId, new StringBuilder());
+            taskDone.put(taskId, false);
+            taskEmitters.put(taskId, new CopyOnWriteArrayList<>());
+        }
+        executor.execute(() -> runDeepAnalyzeAsync(taskId, dto));
         StreamTaskVO vo = new StreamTaskVO();
         vo.setTaskId(taskId);
         return vo;
     }
 
-    @Async
-    public void runDeepAnalyzeAsync(String taskId, AnalyzeRequestDTO dto) {
+    private void runDeepAnalyzeAsync(String taskId, AnalyzeRequestDTO dto) {
         try {
             String systemPrompt = "你是一位精通易经、五行、音韵学和现代心理学的取名分析大师。请对以下名字进行深度分析，从易经八卦、五行八字、字形美学、音韵节奏、心理暗示等角度进行解读。";
             String userPrompt = String.format(
@@ -130,14 +135,17 @@ public class NamingServiceImpl implements NamingService {
             flux.subscribe(
                     chunk -> {
                         if (chunk != null && !chunk.isEmpty()) {
-                            taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder()).append(chunk);
-                            CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.get(taskId);
-                            if (emitters != null) {
-                                for (SseEmitter emitter : emitters) {
-                                    try {
-                                        emitter.send(chunk);
-                                    } catch (Exception e) {
-                                        emitters.remove(emitter);
+                            Object lock = taskLocks.get(taskId);
+                            synchronized (lock != null ? lock : new Object()) {
+                                taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder()).append(chunk);
+                                CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.get(taskId);
+                                if (emitters != null) {
+                                    for (SseEmitter emitter : emitters) {
+                                        try {
+                                            emitter.send(chunk);
+                                        } catch (Exception e) {
+                                            emitters.remove(emitter);
+                                        }
                                     }
                                 }
                             }
@@ -145,17 +153,28 @@ public class NamingServiceImpl implements NamingService {
                     },
                     error -> {
                         log.error("深度分析流式调用失败, taskId={}", taskId, error);
-                        taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
-                                .append("\n\n分析服务异常，请稍后重试。");
-                        finishTask(taskId);
+                        Object lock = taskLocks.get(taskId);
+                        synchronized (lock != null ? lock : new Object()) {
+                            taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
+                                    .append("\n\n分析服务异常，请稍后重试。");
+                            finishTask(taskId);
+                        }
                     },
-                    () -> finishTask(taskId)
+                    () -> {
+                        Object lock = taskLocks.get(taskId);
+                        synchronized (lock != null ? lock : new Object()) {
+                            finishTask(taskId);
+                        }
+                    }
             );
         } catch (Exception e) {
             log.error("深度分析失败, taskId={}", taskId, e);
-            taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
-                    .append("\n\n分析服务异常，请稍后重试。");
-            finishTask(taskId);
+            Object lock = taskLocks.get(taskId);
+            synchronized (lock != null ? lock : new Object()) {
+                taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
+                        .append("\n\n分析服务异常，请稍后重试。");
+                finishTask(taskId);
+            }
         }
     }
 
@@ -176,70 +195,98 @@ public class NamingServiceImpl implements NamingService {
             taskBuffers.remove(taskId);
             taskDone.remove(taskId);
             taskEmitters.remove(taskId);
+            taskLocks.remove(taskId);
             log.info("清理深度分析任务缓存, taskId={}", taskId);
         }, 10, TimeUnit.MINUTES);
     }
 
     @Override
     public String pollStreamContent(String taskId) {
-        StringBuilder sb = taskBuffers.get(taskId);
-        if (sb == null) {
-            return Boolean.TRUE.equals(taskDone.get(taskId)) ? "[DONE]" : "";
+        Object lock = taskLocks.get(taskId);
+        synchronized (lock != null ? lock : new Object()) {
+            StringBuilder sb = taskBuffers.get(taskId);
+            if (sb == null) {
+                return Boolean.TRUE.equals(taskDone.get(taskId)) ? "[DONE]" : "";
+            }
+            String content = sb.toString();
+            if (Boolean.TRUE.equals(taskDone.get(taskId))) {
+                content += "[DONE]";
+                cleanupExecutor.schedule(() -> {
+                    taskBuffers.remove(taskId);
+                    taskDone.remove(taskId);
+                    taskEmitters.remove(taskId);
+                    taskLocks.remove(taskId);
+                }, 30, TimeUnit.SECONDS);
+            }
+            return content;
         }
-        String content = sb.toString();
-        if (Boolean.TRUE.equals(taskDone.get(taskId))) {
-            content += "[DONE]";
-            cleanupExecutor.schedule(() -> {
-                taskBuffers.remove(taskId);
-                taskDone.remove(taskId);
-                taskEmitters.remove(taskId);
-            }, 30, TimeUnit.SECONDS);
-        }
-        return content;
     }
 
     @Override
     public void streamContent(String taskId, SseEmitter emitter) {
-        Boolean done = taskDone.get(taskId);
-        StringBuilder sb = taskBuffers.get(taskId);
-
-        if (done == null || sb == null) {
-            try {
-                emitter.send("任务不存在或已过期");
-                emitter.complete();
-            } catch (Exception ignored) {
-            }
+        Object lock = taskLocks.get(taskId);
+        if (lock == null) {
+            completeEmitter(emitter, "任务不存在或已过期");
             return;
         }
+        synchronized (lock) {
+            Boolean done = taskDone.get(taskId);
+            StringBuilder sb = taskBuffers.get(taskId);
 
-        if (done) {
-            try {
-                emitter.send(sb.toString());
-                emitter.send("[DONE]");
-                emitter.complete();
-            } catch (Exception ignored) {
+            if (done == null || sb == null) {
+                completeEmitter(emitter, "任务不存在或已过期");
+                return;
             }
-            return;
+
+            if (done) {
+                completeEmitterWithDone(emitter, sb.toString());
+                return;
+            }
+
+            CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.computeIfAbsent(taskId, k -> new CopyOnWriteArrayList<>());
+            emitters.add(emitter);
+
+            // 再次检查，防止在 add 前一刻任务刚好完成
+            if (Boolean.TRUE.equals(taskDone.get(taskId))) {
+                completeEmitterWithDone(emitter, sb.toString());
+                emitters.remove(emitter);
+                return;
+            }
+
+            emitter.onCompletion(() -> emitters.remove(emitter));
+            emitter.onTimeout(() -> {
+                emitters.remove(emitter);
+                completeEmitter(emitter, null);
+            });
+            emitter.onError((e) -> {
+                emitters.remove(emitter);
+                try {
+                    emitter.completeWithError(e);
+                } catch (Exception ignored) {
+                }
+            });
         }
+    }
 
-        CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.computeIfAbsent(taskId, k -> new CopyOnWriteArrayList<>());
-        emitters.add(emitter);
+    private void completeEmitter(SseEmitter emitter, String message) {
+        try {
+            if (message != null) {
+                emitter.send(message);
+            }
+            emitter.complete();
+        } catch (Exception ignored) {
+        }
+    }
 
-        emitter.onCompletion(() -> emitters.remove(emitter));
-        emitter.onTimeout(() -> {
-            emitters.remove(emitter);
-            try {
-                emitter.complete();
-            } catch (Exception ignored) {
+    private void completeEmitterWithDone(SseEmitter emitter, String content) {
+        try {
+            if (content != null && !content.isEmpty()) {
+                emitter.send(content);
             }
-        });
-        emitter.onError((e) -> {
-            emitters.remove(emitter);
-            try {
-                emitter.completeWithError(e);
-            } catch (Exception ignored) {
-            }
-        });
+            emitter.send("[DONE]");
+            emitter.complete();
+        } catch (Exception ignored) {
+        }
     }
 
     @Override

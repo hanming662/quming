@@ -60,7 +60,13 @@ public class OpenAiClient {
         return webClient.post()
                 .uri("/chat/completions")
                 .bodyValue(body)
+                .header(HttpHeaders.ACCEPT, MediaType.TEXT_EVENT_STREAM_VALUE)
                 .retrieve()
+                .onStatus(status -> status.isError(), clientResponse ->
+                        clientResponse.bodyToMono(String.class)
+                                .doOnNext(errorBody -> log.error("AI stream API error: {}", errorBody))
+                                .map(errorBody -> new RuntimeException("AI服务调用失败: " + errorBody))
+                )
                 .bodyToFlux(String.class)
                 .filter(line -> line.startsWith("data:"))
                 .map(line -> line.substring(5).trim())

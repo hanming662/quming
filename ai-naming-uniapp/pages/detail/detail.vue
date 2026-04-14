@@ -121,13 +121,23 @@ export default {
         if (event.data === '[DONE]') {
           this.analyzing = false
           es.close()
+          this.es = null
+          return
+        }
+        if (event.data === '任务不存在或已过期' || event.data.includes('服务异常')) {
+          this.analyzing = false
+          this.analysisContent = event.data
+          es.close()
+          this.es = null
           return
         }
         this.analysisContent += event.data
       }
-      es.onerror = () => {
+      es.onerror = (err) => {
         this.analyzing = false
         es.close()
+        this.es = null
+        console.error('EventSource error', err)
       }
     },
     connectStreamUni(taskId) {
