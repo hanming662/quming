@@ -41,13 +41,13 @@ public class NamingController {
     }
 
     @PostMapping("/deepAnalyze")
-    @RateLimit(key = "#request.getHeader('X-Openid')", timeWindow = 60, maxRequests = 5, message = "深度分析请求过于频繁，请1分钟后重试")
+//    @RateLimit(key = "#request.getHeader('X-Openid')", timeWindow = 60, maxRequests = 5, message = "深度分析请求过于频繁，请1分钟后重试")
     public Result<StreamTaskVO> deepAnalyze(@RequestBody AnalyzeRequestDTO dto) {
         return Result.success(namingService.startDeepAnalyze(dto));
     }
 
     @GetMapping(value = "/stream/{taskId}", produces = "text/event-stream;charset=UTF-8")
-    @RateLimit(key = "#taskId", timeWindow = 60, maxRequests = 60, message = "流式请求过于频繁")
+//    @RateLimit(key = "#taskId", timeWindow = 60, maxRequests = 60, message = "流式请求过于频繁")
     public SseEmitter stream(@PathVariable String taskId) {
         SseEmitter emitter = new SseEmitter(0L);
         namingService.streamContent(taskId, emitter);
@@ -55,7 +55,7 @@ public class NamingController {
     }
 
     @GetMapping("/poll/{taskId}")
-    @RateLimit(key = "#taskId", timeWindow = 60, maxRequests = 120, message = "轮询请求过于频繁")
+//    @RateLimit(key = "#taskId", timeWindow = 60, maxRequests = 120, message = "轮询请求过于频繁")
     public Result<String> poll(@PathVariable String taskId) {
         return Result.success(namingService.pollStreamContent(taskId));
     }

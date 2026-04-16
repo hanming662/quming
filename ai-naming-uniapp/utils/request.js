@@ -4,7 +4,7 @@ export const BASE_URL = 'http://localhost:8080'
 // #endif
 // #ifndef H5
 // 微信小程序 / App 请使用真实后端域名（必须 HTTPS 且备案）
-export const BASE_URL = 'http://116.204.135.42:8082'
+export const BASE_URL = 'http://localhost:8082'
 // #endif
 
 function request(options) {

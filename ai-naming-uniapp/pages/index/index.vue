@@ -89,8 +89,8 @@
         <slider
           class="slider"
           :value="form.count"
-          :min="3"
-          :max="10"
+          :min="1"
+          :max="5"
           @change="e => form.count = e.detail.value"
         />
         <text class="count-text">{{ form.count }} 个</text>
@@ -113,7 +113,7 @@ export default {
         gender: 'boy',
         style: 'modern',
         prompt: '',
-        count: 5
+        count: 3
       }
     }
   },
