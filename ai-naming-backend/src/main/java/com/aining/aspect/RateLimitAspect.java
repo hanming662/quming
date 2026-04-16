@@ -16,6 +16,8 @@ import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 import javax.servlet.http.HttpServletRequest;
 import java.lang.reflect.Method;
@@ -96,12 +98,19 @@ public class RateLimitAspect {
             Object[] args = point.getArgs();
 
             EvaluationContext context = new StandardEvaluationContext();
+
+            // 首先从 RequestContextHolder 获取当前请求（兼容无需资源方法未显式传入 HttpServletRequest 的场景）
+            ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+            if (attributes != null) {
+                context.setVariable("request", attributes.getRequest());
+            }
+
             if (paramNames != null) {
                 for (int i = 0; i < paramNames.length; i++) {
                     context.setVariable(paramNames[i], args[i]);
                 }
             }
-            // 兼容 HttpServletRequest 变量名称
+            // 兼容 HttpServletRequest 变量名称（如果方法参数中显式传入了 request，则覆盖 RequestContextHolder 中的值）
             for (int i = 0; i < args.length; i++) {
                 if (args[i] instanceof HttpServletRequest) {
                     context.setVariable("request", args[i]);
