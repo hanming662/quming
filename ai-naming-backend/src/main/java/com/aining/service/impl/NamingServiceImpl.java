@@ -63,6 +63,7 @@ public class NamingServiceImpl implements NamingService {
     // Redis 缓存 TTL：7天
     private static final Duration CACHE_TTL = Duration.ofDays(7);
     private static final String CACHE_KEY_PREFIX = "ai:naming:result:";
+    private static final String ANALYZE_CACHE_KEY_PREFIX = "ai:analyze:result:";
 
     // 自己维护线程池，避免依赖外部 Executor bean 配置
     private final ExecutorService analyzeExecutor = Executors.newFixedThreadPool(4, r -> {
@@ -237,6 +238,28 @@ public class NamingServiceImpl implements NamingService {
 
     @Override
     public StreamTaskVO startDeepAnalyze(AnalyzeRequestDTO dto) {
+        String cacheKey = buildAnalyzeCacheKey(dto);
+        String redisKey = ANALYZE_CACHE_KEY_PREFIX + cacheKey;
+
+        // 1. Redis 缓存命中
+        String cachedContent = stringRedisTemplate.opsForValue().get(redisKey);
+        if (cachedContent != null) {
+            log.info("深度分析命中 Redis 缓存, cacheKey={}", cacheKey);
+            incrementHitCountAsync(cacheKey);
+            return setupCachedAnalyzeTask(cachedContent);
+        }
+
+        // 2. 数据库缓存命中
+        AiResultCache cacheRecord = getDbCache(cacheKey);
+        if (cacheRecord != null) {
+            log.info("深度分析命中数据库缓存, cacheKey={}", cacheKey);
+            stringRedisTemplate.opsForValue().set(redisKey, cacheRecord.getResultJson(), CACHE_TTL);
+            incrementHitCountAsync(cacheKey);
+            return setupCachedAnalyzeTask(cacheRecord.getResultJson());
+        }
+
+        // 3. 未命中缓存，走 AI 流式分析
+        log.info("深度分析未命中缓存，调用 AI API, cacheKey={}", cacheKey);
         String taskId = UUID.randomUUID().toString();
         Object lock = taskLocks.computeIfAbsent(taskId, k -> new Object());
         synchronized (lock) {
@@ -246,6 +269,30 @@ public class NamingServiceImpl implements NamingService {
         }
         log.info("Start deep analyze, taskId={}", taskId);
         analyzeExecutor.execute(() -> runDeepAnalyzeAsync(taskId, dto));
+        StreamTaskVO vo = new StreamTaskVO();
+        vo.setTaskId(taskId);
+        return vo;
+    }
+
+    /**
+     * 为缓存命中的深度分析快速创建内存任务
+     */
+    private StreamTaskVO setupCachedAnalyzeTask(String content) {
+        String taskId = UUID.randomUUID().toString();
+        Object lock = taskLocks.computeIfAbsent(taskId, k -> new Object());
+        synchronized (lock) {
+            taskBuffers.put(taskId, new StringBuilder(content));
+            taskDone.put(taskId, true);
+            taskEmitters.put(taskId, new CopyOnWriteArrayList<>());
+        }
+        // 30 秒后清理任务
+        cleanupExecutor.schedule(() -> {
+            taskBuffers.remove(taskId);
+            taskDone.remove(taskId);
+            taskEmitters.remove(taskId);
+            taskLocks.remove(taskId);
+            log.info("清理缓存深度分析任务, taskId={}", taskId);
+        }, 30, TimeUnit.SECONDS);
         StreamTaskVO vo = new StreamTaskVO();
         vo.setTaskId(taskId);
         return vo;
@@ -290,14 +337,15 @@ public class NamingServiceImpl implements NamingService {
                         synchronized (lock != null ? lock : new Object()) {
                             taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
                                     .append("\\n\\n分析服务异常，请稍后重试。");
-                            finishTask(taskId);
+                            finishTask(taskId, null, null);
                         }
                     },
                     () -> {
                         log.info("深度分析流式调用完成, taskId={}", taskId);
                         Object lock = taskLocks.get(taskId);
                         synchronized (lock != null ? lock : new Object()) {
-                            finishTask(taskId);
+                            String cacheKey = buildAnalyzeCacheKey(dto);
+                            finishTask(taskId, cacheKey, dto);
                         }
                     }
             );
@@ -307,17 +355,21 @@ public class NamingServiceImpl implements NamingService {
             synchronized (lock != null ? lock : new Object()) {
                 taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
                         .append("\\n\\n分析服务异常，请稍后重试。");
-                finishTask(taskId);
+                finishTask(taskId, null, null);
             }
         }
     }
 
-    private void finishTask(String taskId) {
+    private void finishTask(String taskId, String cacheKey, AnalyzeRequestDTO dto) {
         log.info("Finish deep analyze task, taskId={}", taskId);
         StringBuilder sb = taskBuffers.get(taskId);
         if (sb == null || sb.length() == 0) {
             taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
                     .append("分析结果为空，请检查 AI 配置或稍后重试。");
+        }
+        // 保存到缓存
+        if (cacheKey != null && dto != null) {
+            saveAnalyzeToCache(cacheKey, dto, taskBuffers.get(taskId).toString());
         }
         taskDone.put(taskId, true);
         CopyOnWriteArrayList<SseEmitter> emitters = taskEmitters.remove(taskId);
@@ -338,6 +390,32 @@ public class NamingServiceImpl implements NamingService {
             taskLocks.remove(taskId);
             log.info("清理深度分析任务缓存, taskId={}", taskId);
         }, 10, TimeUnit.MINUTES);
+    }
+
+    private void saveAnalyzeToCache(String cacheKey, AnalyzeRequestDTO dto, String content) {
+        try {
+            String redisKey = ANALYZE_CACHE_KEY_PREFIX + cacheKey;
+            stringRedisTemplate.opsForValue().set(redisKey, content, CACHE_TTL);
+
+            AiResultCache cache = new AiResultCache();
+            cache.setCacheKey(cacheKey);
+            cache.setRequestParams(JSON.toJSONString(dto));
+            cache.setResultJson(content);
+            cache.setHitCount(0);
+            aiResultCacheMapper.insert(cache);
+        } catch (Exception e) {
+            log.error("保存分析缓存失败, cacheKey={}", cacheKey, e);
+        }
+    }
+
+    private String buildAnalyzeCacheKey(AnalyzeRequestDTO dto) {
+        String raw = "ANALYZE|"
+                + (dto.getName() != null ? dto.getName() : "") + "|"
+                + (dto.getGender() != null ? dto.getGender() : "") + "|"
+                + (dto.getFatherSurname() != null ? dto.getFatherSurname() : "") + "|"
+                + (dto.getMotherSurname() != null ? dto.getMotherSurname() : "") + "|"
+                + (dto.getType() != null ? dto.getType() : "");
+        return SecureUtil.sha256(raw);
     }
 
     @Override
