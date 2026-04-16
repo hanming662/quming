@@ -2,9 +2,11 @@ package com.aining.service.impl;
 
 import com.aining.dto.AnalyzeRequestDTO;
 import com.aining.dto.NamingRequestDTO;
+import com.aining.entity.AiResultCache;
 import com.aining.entity.HotName;
 import com.aining.entity.NameResult;
 import com.aining.entity.NamingRecord;
+import com.aining.mapper.AiResultCacheMapper;
 import com.aining.mapper.HotNameMapper;
 import com.aining.mapper.NameResultMapper;
 import com.aining.mapper.NamingRecordMapper;
@@ -17,13 +19,16 @@ import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import cn.hutool.crypto.SecureUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.publisher.Flux;
 
 import javax.annotation.PreDestroy;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -47,7 +52,17 @@ public class NamingServiceImpl implements NamingService {
     private UserFavoriteMapper userFavoriteMapper;
 
     @Autowired
+    private AiResultCacheMapper aiResultCacheMapper;
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
     private OpenAiClient openAiClient;
+
+    // Redis 缓存 TTL：7天
+    private static final Duration CACHE_TTL = Duration.ofDays(7);
+    private static final String CACHE_KEY_PREFIX = "ai:naming:result:";
 
     // 自己维护线程池，避免依赖外部 Executor bean 配置
     private final ExecutorService analyzeExecutor = Executors.newFixedThreadPool(4, r -> {
@@ -75,6 +90,29 @@ public class NamingServiceImpl implements NamingService {
 
     @Override
     public List<NameResultVO> generateNames(Long userId, NamingRequestDTO dto) {
+        String cacheKey = buildCacheKey(dto);
+        String redisKey = CACHE_KEY_PREFIX + cacheKey;
+
+        // 1. 尝试从 Redis 缓存获取
+        String cachedJson = stringRedisTemplate.opsForValue().get(redisKey);
+        if (cachedJson != null) {
+            log.info("命名结果命中 Redis 缓存, cacheKey={}", cacheKey);
+            incrementHitCountAsync(cacheKey);
+            return saveAndConvertFromCache(userId, dto, cachedJson);
+        }
+
+        // 2. 尝试从数据库缓存获取
+        AiResultCache cacheRecord = getDbCache(cacheKey);
+        if (cacheRecord != null) {
+            log.info("命名结果命中数据库缓存, cacheKey={}", cacheKey);
+            stringRedisTemplate.opsForValue().set(redisKey, cacheRecord.getResultJson(), CACHE_TTL);
+            incrementHitCountAsync(cacheKey);
+            return saveAndConvertFromCache(userId, dto, cacheRecord.getResultJson());
+        }
+
+        // 3. 未命中缓存，调用 AI 生成
+        log.info("命名结果未命中缓存，调用 AI API, cacheKey={}", cacheKey);
+
         NamingRecord record = new NamingRecord();
         record.setUserId(userId);
         record.setFatherSurname(dto.getFatherSurname());
@@ -97,9 +135,39 @@ public class NamingServiceImpl implements NamingService {
 
         List<NameResult> results = parseNameResults(aiResponse, record.getId());
         if (results.isEmpty()) {
-            results = parseNameResults(generateDefaultNames(dto), record.getId());
+            aiResponse = generateDefaultNames(dto);
+            results = parseNameResults(aiResponse, record.getId());
         }
 
+        for (NameResult result : results) {
+            nameResultMapper.insert(result);
+        }
+
+        // 4. 存入缓存（数据库 + Redis）
+        saveToCache(cacheKey, dto, aiResponse);
+
+        return results.stream()
+                .map(r -> convertToVO(r, userId))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 从缓存中恢复结果并保存用户记录
+     */
+    private List<NameResultVO> saveAndConvertFromCache(Long userId, NamingRequestDTO dto, String aiResponseJson) {
+        NamingRecord record = new NamingRecord();
+        record.setUserId(userId);
+        record.setFatherSurname(dto.getFatherSurname());
+        record.setMotherSurname(dto.getMotherSurname());
+        record.setGender(dto.getGender());
+        record.setPrompt(dto.getPrompt());
+        record.setStyle(dto.getStyle());
+        namingRecordMapper.insert(record);
+
+        List<NameResult> results = parseNameResults(aiResponseJson, record.getId());
+        if (results.isEmpty()) {
+            results = parseNameResults(generateDefaultNames(dto), record.getId());
+        }
         for (NameResult result : results) {
             nameResultMapper.insert(result);
         }
@@ -107,6 +175,64 @@ public class NamingServiceImpl implements NamingService {
         return results.stream()
                 .map(r -> convertToVO(r, userId))
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * 构建缓存 key：基于请求参数的 SHA256
+     */
+    private String buildCacheKey(NamingRequestDTO dto) {
+        String raw = dto.getFatherSurname() + "|"
+                + (dto.getMotherSurname() != null ? dto.getMotherSurname() : "") + "|"
+                + dto.getGender() + "|"
+                + (dto.getPrompt() != null ? dto.getPrompt() : "") + "|"
+                + dto.getStyle() + "|"
+                + dto.getCount();
+        return SecureUtil.sha256(raw);
+    }
+
+    /**
+     * 保存到数据库缓存和 Redis
+     */
+    private void saveToCache(String cacheKey, NamingRequestDTO dto, String aiResponse) {
+        try {
+            // Redis
+            stringRedisTemplate.opsForValue().set(CACHE_KEY_PREFIX + cacheKey, aiResponse, CACHE_TTL);
+
+            // 数据库
+            AiResultCache cache = new AiResultCache();
+            cache.setCacheKey(cacheKey);
+            cache.setRequestParams(JSON.toJSONString(dto));
+            cache.setResultJson(aiResponse);
+            cache.setHitCount(0);
+            aiResultCacheMapper.insert(cache);
+        } catch (Exception e) {
+            log.error("保存缓存失败, cacheKey={}", cacheKey, e);
+        }
+    }
+
+    /**
+     * 从数据库查询缓存
+     */
+    private AiResultCache getDbCache(String cacheKey) {
+        try {
+            LambdaQueryWrapper<AiResultCache> wrapper = new LambdaQueryWrapper<>();
+            wrapper.eq(AiResultCache::getCacheKey, cacheKey);
+            return aiResultCacheMapper.selectOne(wrapper);
+        } catch (Exception e) {
+            log.error("查询数据库缓存失败, cacheKey={}", cacheKey, e);
+            return null;
+        }
+    }
+
+    /**
+     * 异步增加命中次数
+     */
+    private void incrementHitCountAsync(String cacheKey) {
+        try {
+            aiResultCacheMapper.incrementHitCount(cacheKey);
+        } catch (Exception e) {
+            log.error("增加缓存命中次数失败, cacheKey={}", cacheKey, e);
+        }
     }
 
     @Override
@@ -130,7 +256,7 @@ public class NamingServiceImpl implements NamingService {
         try {
             String systemPrompt = "你是一位精通易经、五行、音韵学和现代心理学的取名分析大师。请对以下名字进行深度分析，从易经八卦、五行八字、字形美学、音韵节奏、心理暗示等角度进行解读。";
             String userPrompt = String.format(
-                    "请深度分析名字：%s\n性别：%s\n父姓：%s\n母姓：%s",
+                    "请深度分析名字：%s\\n性别：%s\\n父姓：%s\\n母姓：%s",
                     dto.getName(),
                     dto.getGender(),
                     dto.getFatherSurname(),
@@ -163,7 +289,7 @@ public class NamingServiceImpl implements NamingService {
                         Object lock = taskLocks.get(taskId);
                         synchronized (lock != null ? lock : new Object()) {
                             taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
-                                    .append("\n\n分析服务异常，请稍后重试。");
+                                    .append("\\n\\n分析服务异常，请稍后重试。");
                             finishTask(taskId);
                         }
                     },
@@ -180,7 +306,7 @@ public class NamingServiceImpl implements NamingService {
             Object lock = taskLocks.get(taskId);
             synchronized (lock != null ? lock : new Object()) {
                 taskBuffers.computeIfAbsent(taskId, k -> new StringBuilder())
-                        .append("\n\n分析服务异常，请稍后重试。");
+                        .append("\\n\\n分析服务异常，请稍后重试。");
                 finishTask(taskId);
             }
         }
@@ -337,9 +463,9 @@ public class NamingServiceImpl implements NamingService {
 
     private String buildNamingPrompt(NamingRequestDTO dto) {
         return String.format(
-                "请为%s宝宝取名，父姓：%s，母姓：%s。%s\n风格：%s。生成%d个名字。\n\n" +
-                        "请严格按照以下JSON数组格式返回，不要包含任何markdown标记或其他说明文字：\n" +
-                        "[{\"name\":\"名字\",\"pinyin\":\"拼音\",\"meaning\":\"寓意\",\"wuxing\":\"五行分析\",\"yinyunScore\":8,\"timesScore\":8,\"totalScore\":85,\"reason\":\"推荐理由\"}]",
+                "请为%s宝宝取名，父姓：%s，母姓：%s。%s\\n风格：%s。生成%d个名字。\\n\\n" +
+                        "请严格按照以下JSON数组格式返回，不要包含任何markdown标记或其他说明文字：\\n" +
+                        "[{\\\"name\\\":\\\"名字\\\",\\\"pinyin\\\":\\\"拼音\\\",\\\"meaning\\\":\\\"寓意\\\",\\\"wuxing\\\":\\\"五行分析\\\",\\\"yinyunScore\\\":8,\\\"timesScore\\\":8,\\\"totalScore\\\":85,\\\"reason\\\":\\\"推荐理由\\\"}]",
                 "boy".equals(dto.getGender()) ? "男" : "女",
                 dto.getFatherSurname(),
                 dto.getMotherSurname() != null && !dto.getMotherSurname().isEmpty() ? dto.getMotherSurname() : "无",
@@ -352,9 +478,9 @@ public class NamingServiceImpl implements NamingService {
     private String generateDefaultNames(NamingRequestDTO dto) {
         String surname = dto.getFatherSurname();
         if ("boy".equals(dto.getGender())) {
-            return "[{\"name\":\"" + surname + "宇轩\",\"pinyin\":\"" + surname + " Yǔ Xuān\",\"meaning\":\"气宇轩昂，胸怀广阔\",\"wuxing\":\"土-木\",\"yinyunScore\":9,\"timesScore\":8,\"totalScore\":88,\"reason\":\"音韵流畅，寓意积极向上\"},{\"name\":\"" + surname + "子墨\",\"pinyin\":\"" + surname + " Zǐ Mò\",\"meaning\":\"才华横溢，温文尔雅\",\"wuxing\":\"水-土\",\"yinyunScore\":8,\"timesScore\":9,\"totalScore\":87,\"reason\":\"古典雅致，书香气息浓厚\"}]";
+            return "[{\\\"name\\\":\\\"" + surname + "宇轩\\\",\\\"pinyin\\\":\\\"" + surname + " Yǔ Xuān\\\",\\\"meaning\\\":\\\"气宇轩昂，胸怀广阔\\\",\\\"wuxing\\\":\\\"土-木\\\",\\\"yinyunScore\\\":9,\\\"timesScore\\\":8,\\\"totalScore\\\":88,\\\"reason\\\":\\\"音韵流畅，寓意积极向上\\\"},{\\\"name\\\":\\\"" + surname + "子墨\\\",\\\"pinyin\\\":\\\"" + surname + " Zǐ Mò\\\",\\\"meaning\\\":\\\"才华横溢，温文尔雅\\\",\\\"wuxing\\\":\\\"水-土\\\",\\\"yinyunScore\\\":8,\\\"timesScore\\\":9,\\\"totalScore\\\":87,\\\"reason\\\":\\\"古典雅致，书香气息浓厚\\\"}]";
         } else {
-            return "[{\"name\":\"" + surname + "梓涵\",\"pinyin\":\"" + surname + " Zǐ Hán\",\"meaning\":\"涵养深厚，温婉动人\",\"wuxing\":\"木-水\",\"yinyunScore\":9,\"timesScore\":8,\"totalScore\":89,\"reason\":\"音韵优美，寓意温柔贤淑\"},{\"name\":\"" + surname + "诗雅\",\"pinyin\":\"" + surname + " Shī Yǎ\",\"meaning\":\"诗情画意，高雅脱俗\",\"wuxing\":\"金-木\",\"yinyunScore\":8,\"timesScore\":8,\"totalScore\":86,\"reason\":\"文艺气息浓厚，富有内涵\"}]";
+            return "[{\\\"name\\\":\\\"" + surname + "梓涵\\\",\\\"pinyin\\\":\\\"" + surname + " Zǐ Hán\\\",\\\"meaning\\\":\\\"涵养深厚，温婉动人\\\",\\\"wuxing\\\":\\\"木-水\\\",\\\"yinyunScore\\\":9,\\\"timesScore\\\":8,\\\"totalScore\\\":89,\\\"reason\\\":\\\"音韵优美，寓意温柔贤淑\\\"},{\\\"name\\\":\\\"" + surname + "诗雅\\\",\\\"pinyin\\\":\\\"" + surname + " Shī Yǎ\\\",\\\"meaning\\\":\\\"诗情画意，高雅脱俗\\\",\\\"wuxing\\\":\\\"金-木\\\",\\\"yinyunScore\\\":8,\\\"timesScore\\\":8,\\\"totalScore\\\":86,\\\"reason\\\":\\\"文艺气息浓厚，富有内涵\\\"}]";
         }
     }
 
