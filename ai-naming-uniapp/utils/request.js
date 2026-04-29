@@ -43,5 +43,6 @@ function request(options) {
 
 request.get = (url, data) => request({ url, method: 'GET', data })
 request.post = (url, data) => request({ url, method: 'POST', data })
+request.del = (url, data) => request({ url, method: 'DELETE', data })
 
 export default request

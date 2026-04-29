@@ -44,7 +44,7 @@ ai-naming-uniapp/unpackage/
 ai-naming-uniapp/dist/
 
 # Cursor canvas artifacts
-canvases/*.canvas.status.json
+canvases/*
 
 ### VS Code ###
 .vscode/

@@ -131,7 +131,6 @@ export default {
       try {
         const list = await request.post('/api/naming/generate', this.form)
         uni.setStorageSync('naming_result', list)
-        this.saveHistory(list)
         uni.navigateTo({ url: '/pages/result/result' })
       } catch (e) {
         console.error(e)
@@ -139,27 +138,19 @@ export default {
         uni.hideLoading()
       }
     },
-    saveHistory(list) {
-      const history = uni.getStorageSync('naming_history') || []
-      const record = {
-        id: Date.now(),
-        createTime: new Date().toISOString(),
-        input: { ...this.form },
-        count: list.length,
-        topNames: (list || []).slice(0, 3).map(item => ({
-          id: item.id,
-          name: item.name,
-          pinyin: item.pinyin,
-          totalScore: item.totalScore,
-          isFavorited: item.isFavorited || false
-        }))
+    applyHistoryForm() {
+      const form = uni.getStorageSync('naming_history_form')
+      if (form) {
+        this.form = { ...this.form, ...form }
+        uni.removeStorageSync('naming_history_form')
       }
-      const nextHistory = [record, ...history].slice(0, 20)
-      uni.setStorageSync('naming_history', nextHistory)
     },
     goHistory() {
       uni.navigateTo({ url: '/pages/history/history' })
     }
+  },
+  onShow() {
+    this.applyHistoryForm()
   }
 }
 </script>

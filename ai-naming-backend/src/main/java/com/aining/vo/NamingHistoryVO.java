@@ -15,4 +15,5 @@ public class NamingHistoryVO {
     private String createTime;
     private Integer count;
     private List<NameResultVO> topNames;
+    private List<NameResultVO> allNames;
 }
