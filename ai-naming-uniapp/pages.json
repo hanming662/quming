@@ -31,6 +31,12 @@
       }
     },
     {
+      "path": "pages/history/history",
+      "style": {
+        "navigationBarTitleText": "历史记录"
+      }
+    },
+    {
       "path": "pages/hot/hot",
       "style": {
         "navigationBarTitleText": "热名榜单"

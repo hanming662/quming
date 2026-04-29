@@ -98,6 +98,10 @@
 
       <button class="submit-btn" @click="submit">✨ 开始AI取名</button>
     </view>
+
+    <view class="quick-actions">
+      <button class="ghost-btn" @click="goHistory">📚 历史记录</button>
+    </view>
   </view>
 </template>
 
@@ -127,12 +131,34 @@ export default {
       try {
         const list = await request.post('/api/naming/generate', this.form)
         uni.setStorageSync('naming_result', list)
+        this.saveHistory(list)
         uni.navigateTo({ url: '/pages/result/result' })
       } catch (e) {
         console.error(e)
       } finally {
         uni.hideLoading()
       }
+    },
+    saveHistory(list) {
+      const history = uni.getStorageSync('naming_history') || []
+      const record = {
+        id: Date.now(),
+        createTime: new Date().toISOString(),
+        input: { ...this.form },
+        count: list.length,
+        topNames: (list || []).slice(0, 3).map(item => ({
+          id: item.id,
+          name: item.name,
+          pinyin: item.pinyin,
+          totalScore: item.totalScore,
+          isFavorited: item.isFavorited || false
+        }))
+      }
+      const nextHistory = [record, ...history].slice(0, 20)
+      uni.setStorageSync('naming_history', nextHistory)
+    },
+    goHistory() {
+      uni.navigateTo({ url: '/pages/history/history' })
     }
   }
 }
@@ -278,6 +304,24 @@ export default {
 }
 
 .submit-btn::after {
+  border: none;
+}
+
+.quick-actions {
+  margin-top: 24rpx;
+}
+
+.ghost-btn {
+  height: 84rpx;
+  line-height: 84rpx;
+  background: #fff;
+  color: #666;
+  border: 1rpx solid #eee;
+  border-radius: 42rpx;
+  font-size: 28rpx;
+}
+
+.ghost-btn::after {
   border: none;
 }
 </style>

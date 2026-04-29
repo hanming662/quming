@@ -146,6 +146,7 @@ public class NamingServiceImpl implements NamingService {
 
         // 4. 存入缓存（数据库 + Redis）
         saveToCache(cacheKey, dto, aiResponse);
+        saveNamingHistory(record, results);
 
         return results.stream()
                 .map(r -> convertToVO(r, userId))
@@ -208,6 +209,16 @@ public class NamingServiceImpl implements NamingService {
             aiResultCacheMapper.insert(cache);
         } catch (Exception e) {
             log.error("保存缓存失败, cacheKey={}", cacheKey, e);
+        }
+    }
+
+    private void saveNamingHistory(NamingRecord record, List<NameResult> results) {
+        try {
+            if (record != null && results != null) {
+                log.info("保存取名历史成功, recordId={}, resultCount={}", record.getId(), results.size());
+            }
+        } catch (Exception e) {
+            log.error("保存取名历史失败, recordId={}", record != null ? record.getId() : null, e);
         }
     }
 

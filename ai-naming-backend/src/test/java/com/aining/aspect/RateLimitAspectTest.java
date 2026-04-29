@@ -37,6 +37,8 @@ class RateLimitAspectTest {
             field.set(aspect, redisTemplate);
         } catch (IllegalAccessException e) {
             throw new RuntimeException(e);
+        } catch (NoSuchFieldException e) {
+            throw new RuntimeException(e);
         }
 
         point = mock(ProceedingJoinPoint.class);
@@ -62,7 +64,7 @@ class RateLimitAspectTest {
     }
 
     @Test
-    void shouldBlockWhenOverLimit() {
+    void shouldBlockWhenOverLimit() throws NoSuchMethodException {
         when(redisTemplate.execute(any(DefaultRedisScript.class), anyList(), anyString(), anyString(), anyString()))
                 .thenReturn(0L);
 

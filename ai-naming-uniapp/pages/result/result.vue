@@ -59,10 +59,23 @@ export default {
       compareList: []
     }
   },
-  onLoad() {
+  async onLoad() {
     this.list = uni.getStorageSync('naming_result') || []
+    await this.syncFavoriteStatus()
   },
   methods: {
+    async syncFavoriteStatus() {
+      try {
+        const favorites = await request.get('/api/favorite/list')
+        const favoriteIdSet = new Set((favorites || []).map(item => item.id))
+        this.list = this.list.map(item => ({
+          ...item,
+          isFavorited: favoriteIdSet.has(item.id)
+        }))
+      } catch (e) {
+        console.error('syncFavoriteStatus error', e)
+      }
+    },
     goDetail(item) {
       uni.setStorageSync('current_name', item)
       uni.navigateTo({
@@ -74,12 +87,16 @@ export default {
         if (item.isFavorited) {
           await request.post('/api/favorite/remove/' + item.id)
           item.isFavorited = false
+          uni.showToast({ title: '已取消收藏', icon: 'none' })
         } else {
           await request.post('/api/favorite/add/' + item.id)
           item.isFavorited = true
+          uni.showToast({ title: '收藏成功', icon: 'none' })
         }
       } catch (e) {
         console.error(e)
+        uni.showToast({ title: '操作失败，请重试', icon: 'none' })
+        await this.syncFavoriteStatus()
       }
     },
     toggleCompare(item) {
