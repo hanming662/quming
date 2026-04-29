@@ -39,5 +39,12 @@ logs/
 !**/src/main/**/build/
 !**/src/test/**/build/
 
+# UniApp / front-end build outputs
+ai-naming-uniapp/unpackage/
+ai-naming-uniapp/dist/
+
+# Cursor canvas artifacts
+canvases/*.canvas.status.json
+
 ### VS Code ###
 .vscode/
